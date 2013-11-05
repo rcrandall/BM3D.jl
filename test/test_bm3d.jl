@@ -17,24 +17,24 @@ img.properties["limits"] = (0.0,255.0)
 
 # Noisy image
 imgn = deepcopy(img)
-sig = 20.0
+sig = 15.0
 imgn.data += sig*randn(512,512)
 
 # Perform BM3D denoising
-@time imgBasic = bm3d_thr(imgn.data,sig)
-@time imgOut = bm3d_wie(imgn.data,imgBasic,sig)
+@time (imgBasic,mTab) = bm3d_thr(imgn.data,sig)
+#@time imgOut = bm3d_wie(imgn.data,imgBasic,sig)
 
 imgBasic = convert(Image,imgBasic)
 imgBasic.properties["limits"] = (0.0,255.0)
 
-imgOut = convert(Image,imgOut)
-imgOut.properties["limits"] = (0.0,255.0)
+#imgOut = convert(Image,imgOut)
+#imgOut.properties["limits"] = (0.0,255.0)
 
 errNoisy = getPsnr(imgn.data,img.data)
 errBasic = getPsnr(img.data,imgBasic.data)
-errFinal = getPsnr(img.data,imgOut.data)
+#errFinal = getPsnr(img.data,imgOut.data)
 
 println("PSNR noisy: ", errNoisy, " dB")
-println("PSNR denoised: ", errFinal, " dB")
+println("PSNR basic: ", errBasic, " dB")
 
-display([imgn imgOut])
+display([imgn imgBasic])
