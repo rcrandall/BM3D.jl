@@ -89,8 +89,7 @@ function bm3d_wie(img::Matrix{Float64}, imgBasic::Matrix{Float64}, sigma::Float6
 	G3Dbasic = form_groups(imgBasic,matchTable,Ilist,Jlist,patchSize)
 
 	# Wiener filtering of 3D groups, using basic estimate as target spectrum
-	WC = G3Dbasic.^2./(G3Dbasic.^2 + sigma^2) # devec?
-	G3D .*= WC
+	@devec G3D .*= G3Dbasic.^2./(G3Dbasic.^2 + sigma^2)
 
 	# Weight groups 
 	W = zeros(Float64,size(G3D))
