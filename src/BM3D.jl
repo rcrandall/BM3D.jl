@@ -15,6 +15,9 @@
 # - Only works on matrix of Float64 for now, add methods for Image classes
 # - This algorithm is parallelizable.  See e.g. Marc Lebrun's C++ implementation
 # - Using DCT instead of wavelet for 1st step; implement bior1.5 (is there a package for this?)
+# - This implementation is rather slow, since it computes the entire 3D group spectrum at 
+#   once.  A better implementation uses a rolling buffer to only compute the 3D groups in 
+#   the current search window
 # - Remove magic numbers / hard-coded parameters
 # - Add Kaiser window to reduce border effects between patches
 
@@ -22,150 +25,207 @@ module BM3D
 export bm3d_thr, bm3d_wie
 
 using Hadamard
-using Devectorize
 using NumericExtensions
 
 # 1st step of BM3D denoising: hard thresholding
 function bm3d_thr(img::Matrix{Float64}, sigma::Float64)
 
 	# Hard code algorithm parameters for now...
-	patchSize = 32
-	stepSize = 32
-	nBorder = 0 # unused for now
-	searchWin = 3
-	nMatch = 1
+	patchSize = [8;8] 
+	stepSize = [3;3]  
+	nBorder = [0;0]
+	searchWin = [19;19]
+	nMatch = 31
 	thresh3D = 2.7
-
-	imgOut = zeros(Float64,size(img))
-	wOut = zeros(Float64,size(img))
 
 	# Block matching
 	(Ilist,Jlist) = get_reference_pixels([size(img,1);size(img,2)],patchSize,stepSize,nBorder)
+	matchTable = match_patches(img,Ilist,Jlist,patchSize,searchWin,nMatch)
 
-	# Initialize match table 
-	matchTable = zeros(Float64,3,nMatch,length(Ilist),searchWin+1)
-	maxTable = ones(Float64,2,length(Ilist),searchWin+1)
-    matchTable[3,:,:,:] = realmax(Float64)
-    maxTable[2,:,:] = realmax(Float64)
+	G3D = form_groups(img,matchTable,Ilist,Jlist,patchSize)
 
-	# Initialize patch table
-	patchTable = zeros(Float64,patchSize,patchSize,length(Ilist),2*searchWin+1)
+	# Filter 3D groups by hard thresholding 
+	G3D[abs(G3D) .< sigma*thresh3D] = 0
 
-	# Initialize 3D groups
-	G3D = zeros(Float64,nMatch+1,patchSize,patchSize,length(Ilist))
-	W = zeros(Float64,size(G3D))
-
+	W = zeros(size(G3D))
 	for j = 1:length(Jlist)
-		if (nMatch > 0)
-			update_matches!(j,img,matchTable,maxTable,Ilist,Jlist,patchSize,searchWin,nMatch)
-		end
-		update_patches!(j,img,patchTable,Ilist,Jlist,patchSize,searchWin)
-		
-		form_groups!(G3D,patchTable,matchTable,Ilist,Jlist,patchSize,searchWin)
-
-		# Filter 3D groups by hard thresholding 
-		@devec G3D[abs(G3D) .< sigma*thresh3D] = 0
-
-		# Compute weights
 		for i = 1:length(Ilist)
-			T = nnz(G3D[:,:,:,i])
-			T2 = T > 0 ? 1.0/T : 1.0
-			W[:,:,:,i] = 1
-			G3D[:,:,:,i] *= 1
+			T = nnz(G3D[:,:,:,i,j])
+			W[:,:,:,i,j] = T > 0 ? 1.0/T : 1.0
 		end
-
-		# Normalized inverse Walsh-Hadamard transform on 3rd dimension of groups
-		G3D = ifwht(G3D,1)/sqrt(float(nMatch+1))
-
-		# Apply inverse 2D DCT on each patch
-		idct!(G3D,2:3)
-
-		groups_to_image!(j,imgOut,G3D,matchTable,Ilist,Jlist,patchSize) 
-		groups_to_image!(j,wOut,W,matchTable,Ilist,Jlist,patchSize)
 	end
+	G3D .*= W
 
-	return (imgOut./wOut,matchTable)
+	imgOut = invert_groups([size(img,1);size(img,2)],G3D,matchTable,Ilist,Jlist,patchSize) 
+
+	Wout = zeros(Float64,size(img))
+	groups_to_image!(Wout,W,matchTable,Ilist,Jlist,patchSize)
+
+	return imgOut./Wout
 
 end
 
-# Forward BM3D groupings for the current column
-function form_groups!(G3D::Array{Float64,4},
-	                  patchTable::Array{Float64,4},
-					  matchTable::Array{Float64,4},
-					  Ilist::Vector{Int64},
-					  Jlist::Vector{Int64},
-					  patchSize::Int64,
-					  searchWin::Int64)
+# 2nd step of BM3D
+# img: input noisy image
+# imgBasic: denoised image from first step of BM3D (hard thresholding)
+# sigma: known or assumed standard deviation of noise
+function bm3d_wie(img::Matrix{Float64}, imgBasic::Matrix{Float64}, sigma::Float64)
+
+	# Hard code algorithm parameters for now...
+	patchSize = [8;8] 
+	stepSize = [3;3]  
+	nBorder = [0;0]
+	searchWin = [11;11]
+	nMatch = 15
+	thresh3D = 2.7
+
+	# block matching step
+	(Ilist,Jlist) = get_reference_pixels([size(img,1);size(img,2)],patchSize,stepSize,nBorder)
+	matchTable = match_patches(imgBasic,Ilist,Jlist,patchSize,searchWin,nMatch)
+
+	# Compute 3D group spectrum
+	G3D = form_groups(img,matchTable,Ilist,Jlist,patchSize)
+	G3Dbasic = form_groups(imgBasic,matchTable,Ilist,Jlist,patchSize)
+
+	# Wiener filtering of 3D groups, using basic estimate as target spectrum
+	WC = G3Dbasic.^2./(G3Dbasic.^2 + sigma^2) # devec?
+	G3D .*= WC
+
+	# Weight groups 
+	W = zeros(Float64,size(G3D))
+	for j = 1:length(Jlist)
+		for i = 1:length(Ilist)
+			T = sumsq(WC[:,:,:,i,j])
+			W[:,:,:,i,j] = T > 0 ? 1.0/T : 1.0
+		end
+	end
+
+	G3D .*= W
+
+	Wout = zeros(Float64,size(img))
+	groups_to_image!(Wout,W,matchTable,Ilist,Jlist,patchSize)
+
+	imgOut = invert_groups([size(img,1);size(img,2)],G3D,matchTable,Ilist,Jlist,patchSize) 
+
+	return imgOut./Wout
+
+end
+
+# Forward BM3D groupings (full transform... inefficient!)
+function form_groups(img::Matrix{Float64},
+					 matchTable::Array{Float64,4},
+					 Ilist::Vector{Int64},
+					 Jlist::Vector{Int64},
+					 patchSize::Vector{Int64})
 
 	(t,Nmatch,N1,N2) = size(matchTable)
 
-	# Process current column
-	for i1 = 1:length(Ilist)
+	G3D = zeros(Float64,Nmatch+1,patchSize[1],patchSize[2],N1,N2)
 
-		# Each patch self-matches
-		for jj = 1:patchSize
-			for ii = 1:patchSize
-				G3D[1,ii,jj,i1] = patchTable[ii,jj,i1,searchWin+1]
-			end
-		end
+	# Form table of 3D groups
+	image_to_groups!(img,G3D,matchTable,Ilist,Jlist,patchSize)
 
-		# Add other matched patches to the group
-		for k = 1:Nmatch
-			i2 = i1 + matchTable[1,k,i1,1]
-			j2 = searchWin + 1 + matchTable[2,k,i1,1]
-			for jj = 1:patchSize
-				for ii = 1:patchSize
-					G3D[k+1,ii,jj,i1] = patchTable[ii,jj,i2,j2]
-				end
-			end
-		end
-	end
+	# Apply 3D DCT on groups
+	dct!(G3D,1:3)
 
-	# Apply 2D DCT on each patch
-	dct!(G3D,2:3)
+	# Apply normalized Walsh-Hadamard transform on 3rd dimension of groups
+	#G3D = fwht(G3D,1)*sqrt(float(Nmatch+1))
 
-	# Apply normalized Walsh-Hadamard transform along 3rd dimension of groups
-	G3D = fwht(G3D,1)*sqrt(float(Nmatch+1))
+	return G3D
+
+end
+
+# Inverse BM3D
+function invert_groups(imgSize::Vector{Int64},
+					   G3D::Array{Float64,5},
+					   matchTable::Array{Float64,4},
+					   Ilist::Vector{Int64},
+					   Jlist::Vector{Int64},
+					   patchSize::Vector{Int64})
+
+	(t,Nmatch,N1,N2) = size(matchTable)
+
+	# Allocate image and weight table
+	img = zeros(Float64,imgSize[1],imgSize[2])
+
+	# Normalized inverse Walsh-Hadamard transform on 3rd dimension of groups
+	#G3D = ifwht(G3D,1)/sqrt(float(Nmatch+1))
+
+	# Apply inverse 3D DCT on groups
+	idct!(G3D,1:3)
+
+	groups_to_image!(img,G3D,matchTable,Ilist,Jlist,patchSize)
+
+	return img
+
 end
 
 # Return filtered patches to their place in the image
-function groups_to_image!(jIn::Int64,
-						  img::Matrix{Float64},
-						  G3D::Array{Float64,},
+function groups_to_image!(img::Matrix{Float64},
+						  G3D::Array{Float64,5},
 						  matchTable::Array{Float64,4},
 						  Ilist::Vector{Int64},
 						  Jlist::Vector{Int64},
-						  patchSize::Int64)
+						  patchSize::Vector{Int64})
 
 	Nmatch = size(matchTable,2)
 
-	j1 = jIn
-	
-		# Process each patch in current column
+	for j1 = 1:length(Jlist)
 		for i1 = 1:length(Ilist)
 
-			# Each patch self-matches
-			for jj = 1:patchSize
-				for ii = 1:patchSize
-					img[Ilist[i1]+ii-1,Jlist[j1]+jj-1] += G3D[1,ii,jj,i1]
+			for jj = 1:patchSize[2]
+				for ii = 1:patchSize[1]
+					img[Ilist[i1]+ii-1,Jlist[j1]+jj-1] += G3D[1,ii,jj,i1,j1]
 				end
 			end
 
-			# 
 			for k = 1:Nmatch
-				i2 = i1 + matchTable[1,k,i1,1]
-				j2 = j1 + matchTable[2,k,i1,1]
 
-				for jj = 1:patchSize
-					for ii = 1:patchSize
-						img[Ilist[i2]+ii-1,Jlist[j2]+jj-1] += G3D[k+1,ii,jj,i1]
+				i2 = i1 + matchTable[1,k,i1,j1]
+				j2 = j1 + matchTable[2,k,i1,j1]
+
+				for jj = 1:patchSize[2]
+					for ii = 1:patchSize[1]
+						img[Ilist[i2]+ii-1,Jlist[j2]+jj-1] += G3D[k+1,ii,jj,i1,j1]
 					end
 				end
 			end
 
 		end
+	end
 end
 
+function image_to_groups!(img::Matrix{Float64},
+	                      G3D::Array{Float64,5},
+	                      matchTable::Array{Float64,4},
+	                      Ilist::Vector{Int64},
+	                      Jlist::Vector{Int64},
+	                      patchSize::Vector{Int64})
+
+	Nmatch = size(matchTable,2)
+
+	for j1 = 1:length(Jlist)
+		for i1 = 1:length(Ilist)
+			for jj = 1:patchSize[2]
+				for ii = 1:patchSize[1]
+					G3D[1,ii,jj,i1,j1] = img[Ilist[i1]+ii-1,Jlist[j1]+jj-1]
+				end
+			end
+
+			for k = 1:Nmatch
+
+				i2 = i1 + matchTable[1,k,i1,j1]
+				j2 = j1 + matchTable[2,k,i1,j1]
+
+				for jj = 1:patchSize[2]
+					for ii = 1:patchSize[1]
+						G3D[k+1,ii,jj,i1,j1] = img[Ilist[i2]+ii-1,Jlist[j2]+jj-1]
+					end
+				end
+			end
+		end
+	end
+end
 
 # Get locations of reference pixels, the upper-left corner of each patch.
 
@@ -175,22 +235,22 @@ end
 # nBorder - number of border pixels on each side in x and y
 
 function get_reference_pixels(imgSize::Vector{Int64},
-							  patchSize::Int64,
-							  stepSize::Int64,
-							  nBorder::Int64)
+							  patchSize::Vector{Int64},
+							  stepSize::Vector{Int64},
+							  nBorder::Vector{Int64})
 
-    ph = imgSize[1] - 2*nBorder - patchSize + 1
-    pw = imgSize[2] - 2*nBorder - patchSize + 1
+    ph = imgSize[1] - 2*nBorder[1] - patchSize[1] + 1
+    pw = imgSize[2] - 2*nBorder[2] - patchSize[2] + 1
 
-    I = [nBorder + 1:stepSize:ph]
-    J = [nBorder + 1:stepSize:pw]
+    I = [nBorder[1] + 1:stepSize[1]:ph]
+    J = [nBorder[2] + 1:stepSize[2]:pw]
 
     # Make sure there is a patch touching the lower and right borders
-    if(maximum(I) < nBorder + ph)
-        I = [I; nBorder + ph]
+    if(maximum(I) < nBorder[1] + ph)
+        I = [I; nBorder[1] + ph]
     end
-    if(maximum(J) < nBorder + pw)
-        I = [J; nBorder + pw]
+    if(maximum(J) < nBorder[2] + pw)
+        I = [J; nBorder[2] + pw]
     end
 
     return (I,J)
@@ -198,101 +258,70 @@ function get_reference_pixels(imgSize::Vector{Int64},
 end
 
 # Full-search block matching algorithm for BM3D
-function update_matches!(jIn::Int64,
-						 img::Matrix{Float64},
-					     matchTable::Array{Float64,4},
-					     matchMaxTable::Array{Float64,3},
-					     Ilist::Vector{Int64},
-					     Jlist::Vector{Int64},
-					     patchSize::Int64,
-					     searchWin::Int64,
-					     nMatch::Int64)
+function match_patches(img::Matrix{Float64},
+					   Ilist::Vector{Int64},
+					   Jlist::Vector{Int64},
+					   patchSize::Vector{Int64},
+					   searchWin::Vector{Int64},
+					   nMatch::Int64)
 
 	# Dimensions of patch table
 	N1 = length(Ilist)
 	N2 = length(Jlist)
 
-	if(jIn > 1)
-		# Shift match table to reuse previous computations
-		matchTable[:,:,:,1:searchWin] = matchTable[:,:,:,2:end]
-		matchMaxTable[:,:,1:searchWin] = matchMaxTable[:,:,2:end]
-		#matchTable[3,:,:,end] = realmax(Float64)
-		#matchMaxTable[2,:,end] = realmax(Float64)
-	end
+	# Allocate 
+	matchTable = zeros(Float64,(3,nMatch,N1,N2))
+    matchMaxTable = ones(Float64,(2,N1,N2))
+    matchTable[3,:,:,:] = realmax(Float64)
+    matchMaxTable[2,:,:] = realmax(Float64)
 
-	j1 = jIn
+    for j1 = 1:N2
     	for i1 = 1:N1
-    		for j2 = j1:minimum([N2;j1 + searchWin])
-    		# Lower bound on rows: only search down in current row
-    		LB = (j1 == j2) ? (i1+1) : (i1 - searchWin)
-    		for i2 = maximum([1,LB]):minimum([i1+searchWin;N1])
-    			if(i1 != i2 || j1 != j2)
+    	
+    		for j2 = j1:minimum([N2;j1 + searchWin[2]])
+    		# Lower bound on columns
+    		LB = (j1 == j2) ? (i1+1) : (i1 - searchWin[1])
+    		for i2 = maximum([1,LB]):minimum([i1+searchWin[1];N1])
+
     				d2 = 0.0
-    				for jj = 1:patchSize
-    					for ii = 1:patchSize
-    						d2 += (img[Ilist[i1] + ii - 1,Jlist[j1] + jj - 1] 
-    							 - img[Ilist[i2] + ii - 1,Jlist[j2] + jj - 1])^2
+    				for jj = 1:patchSize[2]
+    					for ii = 1:patchSize[1]
+    						d2 += (img[Ilist[i1] + ii - 1,Jlist[j1] + jj - 1] - img[Ilist[i2] + ii - 1,Jlist[j2] + jj - 1])^2
     					end
     				end
     				d2 /= prod(patchSize)
 
     				 # Check current maximum for patch (i1,j1)
-	                 if (d2 < matchMaxTable[2,i1,1])
-	                 	kmatch = matchMaxTable[1,i1,1]
-	                 	matchTable[1,kmatch,i1,1] = i2-i1
-	                 	matchTable[2,kmatch,i1,1] = j2-j1
-	                 	matchTable[3,kmatch,i1,1] = d2
+	                 if (d2 < matchMaxTable[2,i1,j1])
+	                 	kmatch = matchMaxTable[1,i1,j1]
+	                 	matchTable[1,kmatch,i1,j1] = i2-i1
+	                 	matchTable[2,kmatch,i1,j1] = j2-j1
+	                 	matchTable[3,kmatch,i1,j1] = d2
 
-	                 	(tmp2,tmp1) = findmax(matchTable[3,:,i1,1])
-	                    matchMaxTable[1,i1,1] = tmp1
-	                    matchMaxTable[2,i1,1] = tmp2
+	                 	(tmp2,tmp1) = findmax(matchTable[3,:,i1,j1])
+	                    matchMaxTable[1,i1,j1] = tmp1
+	                    matchMaxTable[2,i1,j1] = tmp2
 	                 end
 
 	                 # Check current maximum for patch (i2,j2)
-	                 if (d2 < matchMaxTable[2,i2,j2-jIn+1])
-	                 	kmatch = matchMaxTable[1,i2,j2-jIn+1]
-	                 	matchTable[1,kmatch,i2,j2-jIn+1] = i1-i2
-	                 	matchTable[2,kmatch,i2,j2-jIn+1] = j1-j2
-	                 	matchTable[3,kmatch,i2,j2-jIn+1] = d2
+	                 if (d2 < matchMaxTable[2,i2,j2])
+	                 	kmatch = matchMaxTable[1,i2,j2]
+	                 	matchTable[1,kmatch,i2,j2] = i1-i2
+	                 	matchTable[2,kmatch,i2,j2] = j1-j2
+	                 	matchTable[3,kmatch,i2,j2] = d2
 
-	                    (tmp2,tmp1) = findmax(matchTable[3,:,i2,j2-jIn+1])
-	                    matchMaxTable[1,i2,j2-jIn+1] = tmp1
-	                    matchMaxTable[2,i2,j2-jIn+1] = tmp2
+	                    (tmp2,tmp1) = findmax(matchTable[3,:,i2,j2])
+	                    matchMaxTable[1,i2,j2] = tmp1
+	                    matchMaxTable[2,i2,j2] = tmp2
 	                 end
-					end
+
     			end
     		end
 
     	end
-end
+    end
 
-function update_patches!(jIn::Int64,
-						 img::Matrix{Float64},
-						 patchTable::Array{Float64,4},
-						 Ilist::Vector{Int64},
-						 Jlist::Vector{Int64},
-						 patchSize::Int64,
-						 searchWin::Int64)
-
-	# If processing first column, compute all patches to the right within the search window
-	if(jIn == 1)
-		for j = 1:min(searchWin+1,length(Jlist))
-			for i = 1:length(Ilist)
-				patchTable[:,:,i,searchWin + j] = img[Ilist[i]:(Ilist[i]+patchSize-1),Jlist[j]:(Jlist[j]+patchSize-1)]
-			end
-		end
-
-	# If past first column, reuse patches we've already looked at and get the patches in the rightmost column
-	else
-		# Shift table...
-		patchTable[:,:,:,1:(2*searchWin)] = patchTable[:,:,:,2:(2*searchWin+1)]
-
-		if(jIn + searchWin <= length(Jlist))
-			for i = 1:length(Ilist)
-				patchTable[:,:,i,end] = img[Ilist[i]:(Ilist[i]+patchSize-1),Jlist[jIn+searchWin]:(Jlist[jIn+searchWin]+patchSize-1)]
-			end
-		end
-	end
+	return matchTable
 
 end
 
