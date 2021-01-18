@@ -250,7 +250,7 @@ function get_reference_pixels(imgSize::Vector{Int64},
         I = [I; nBorder[1] + ph]
     end
     if(maximum(J) < nBorder[2] + pw)
-        I = [J; nBorder[2] + pw]
+        J = [J; nBorder[2] + pw]
     end
 
     return (I,J)
